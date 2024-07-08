@@ -229,11 +229,7 @@ func GetGPUInfo() GpuInfoList {
 			return GpuInfoList{cpus[0].GpuInfo}
 		}
 
-		// On windows we bundle the nvidia library one level above the runner dir
-		depPath := ""
-		if runtime.GOOS == "windows" && envconfig.RunnersDir() != "" {
-			depPath = filepath.Join(filepath.Dir(envconfig.RunnersDir()), "cuda")
-		}
+		depPath := GetDepDir()
 
 		// Load ALL libraries
 		cHandles = initCudaHandles()
@@ -305,38 +301,34 @@ func GetGPUInfo() GpuInfoList {
 		// Intel
 		if envconfig.IntelGPU() {
 			oHandles = initOneAPIHandles()
-			// On windows we bundle the oneapi library one level above the runner dir
-			depPath = ""
-			if runtime.GOOS == "windows" && envconfig.RunnersDir() != "" {
-				depPath = filepath.Join(filepath.Dir(envconfig.RunnersDir()), "oneapi")
-			}
-
-			for d := range oHandles.oneapi.num_drivers {
-				if oHandles.oneapi == nil {
-					// shouldn't happen
-					slog.Warn("nil oneapi handle with driver count", "count", int(oHandles.oneapi.num_drivers))
-					continue
-				}
-				devCount := C.oneapi_get_device_count(*oHandles.oneapi, C.int(d))
-				for i := range devCount {
-					gpuInfo := OneapiGPUInfo{
-						GpuInfo: GpuInfo{
-							Library: "oneapi",
-						},
-						driverIndex: int(d),
-						gpuIndex:    int(i),
+			if oHandles != nil && oHandles.oneapi != nil {
+				for d := range oHandles.oneapi.num_drivers {
+					if oHandles.oneapi == nil {
+						// shouldn't happen
+						slog.Warn("nil oneapi handle with driver count", "count", int(oHandles.oneapi.num_drivers))
+						continue
 					}
-					// TODO - split bootstrapping from updating free memory
-					C.oneapi_check_vram(*oHandles.oneapi, C.int(d), i, &memInfo)
-					// TODO - convert this to MinimumMemory based on testing...
-					var totalFreeMem float64 = float64(memInfo.free) * 0.95 // work-around: leave some reserve vram for mkl lib used in ggml-sycl backend.
-					memInfo.free = C.uint64_t(totalFreeMem)
-					gpuInfo.TotalMemory = uint64(memInfo.total)
-					gpuInfo.FreeMemory = uint64(memInfo.free)
-					gpuInfo.ID = C.GoString(&memInfo.gpu_id[0])
-					gpuInfo.Name = C.GoString(&memInfo.gpu_name[0])
-					gpuInfo.DependencyPath = depPath
-					oneapiGPUs = append(oneapiGPUs, gpuInfo)
+					devCount := C.oneapi_get_device_count(*oHandles.oneapi, C.int(d))
+					for i := range devCount {
+						gpuInfo := OneapiGPUInfo{
+							GpuInfo: GpuInfo{
+								Library: "oneapi",
+							},
+							driverIndex: int(d),
+							gpuIndex:    int(i),
+						}
+						// TODO - split bootstrapping from updating free memory
+						C.oneapi_check_vram(*oHandles.oneapi, C.int(d), i, &memInfo)
+						// TODO - convert this to MinimumMemory based on testing...
+						var totalFreeMem float64 = float64(memInfo.free) * 0.95 // work-around: leave some reserve vram for mkl lib used in ggml-sycl backend.
+						memInfo.free = C.uint64_t(totalFreeMem)
+						gpuInfo.TotalMemory = uint64(memInfo.total)
+						gpuInfo.FreeMemory = uint64(memInfo.free)
+						gpuInfo.ID = C.GoString(&memInfo.gpu_id[0])
+						gpuInfo.Name = C.GoString(&memInfo.gpu_name[0])
+						gpuInfo.DependencyPath = depPath
+						oneapiGPUs = append(oneapiGPUs, gpuInfo)
+					}
 				}
 			}
 		}
@@ -464,9 +456,11 @@ func GetGPUInfo() GpuInfoList {
 func FindGPULibs(baseLibName string, defaultPatterns []string) []string {
 	// Multiple GPU libraries may exist, and some may not work, so keep trying until we exhaust them
 	var ldPaths []string
-	var patterns []string
 	gpuLibPaths := []string{}
 	slog.Debug("Searching for GPU library", "name", baseLibName)
+
+	// Start with our bundled libraries
+	patterns := []string{filepath.Join(GetDepDir(), baseLibName)}
 
 	switch runtime.GOOS {
 	case "windows":
@@ -476,13 +470,14 @@ func FindGPULibs(baseLibName string, defaultPatterns []string) []string {
 	default:
 		return gpuLibPaths
 	}
-	// Start with whatever we find in the PATH/LD_LIBRARY_PATH
+
+	// Then with whatever we find in the PATH/LD_LIBRARY_PATH
 	for _, ldPath := range ldPaths {
 		d, err := filepath.Abs(ldPath)
 		if err != nil {
 			continue
 		}
-		patterns = append(patterns, filepath.Join(d, baseLibName+"*"))
+		patterns = append(patterns, filepath.Join(d, baseLibName))
 	}
 	patterns = append(patterns, defaultPatterns...)
 	slog.Debug("gpu library search", "globs", patterns)
@@ -637,4 +632,32 @@ func (l GpuInfoList) GetVisibleDevicesEnv() (string, string) {
 		slog.Debug("no filter required for library " + l[0].Library)
 		return "", ""
 	}
+}
+
+func GetDepDir() string {
+	// On Windows/linux we bundle the dependencies at the same level as the executable
+	appExe, err := os.Executable()
+	if err != nil {
+		slog.Warn("failed to lookup executable path", "error", err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		slog.Warn("failed to lookup working directory", "error", err)
+	}
+	// Scan for any of our dependeices, and pick first match
+	for _, root := range []string{filepath.Dir(appExe), cwd} {
+		libDep := "ollama_libs"
+		if _, err := os.Stat(filepath.Join(root, libDep)); err == nil {
+			return filepath.Join(root, libDep)
+		}
+		// Developer mode, local build
+		if _, err := os.Stat(filepath.Join(root, runtime.GOOS+"-"+runtime.GOARCH, libDep)); err == nil {
+			return filepath.Join(root, runtime.GOOS+"-"+runtime.GOARCH, libDep)
+		}
+		if _, err := os.Stat(filepath.Join(root, "dist", runtime.GOOS+"-"+runtime.GOARCH, libDep)); err == nil {
+			return filepath.Join(root, "dist", runtime.GOOS+"-"+runtime.GOARCH, libDep)
+		}
+	}
+	slog.Warn("unable to locate gpu dependency libraries")
+	return ""
 }
